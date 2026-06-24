@@ -1,0 +1,17 @@
+double h(double tau){
+  return 35*pow(tau,4) - 84*pow(tau,5) + 70*pow(tau,6) - 20*pow(tau,7);
+}
+
+double Scurve(double t,double T,double Vmax){
+  double tau;double V;double Ta;
+  Ta=T/2;
+  if (t<=Ta){
+    tau=t/Ta;
+    V=Vmax*h(tau);
+  }
+  else if (t > Ta && t <= T){
+    tau=(T-t)/Ta;
+    V=Vmax*h(tau);
+  }
+  return V;
+}
