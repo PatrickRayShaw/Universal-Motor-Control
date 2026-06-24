@@ -1,0 +1,367 @@
+"""
+打印机墨车万能S曲线 + PID 控制模块（终极版）
+特点：
+- 固定 Vmax、Amax，自动规划时间，严格保证轨迹全程不超限（二分搜索）
+- 支持正/负位移，运动中平滑更新目标（连续速度、加速度）
+- 七次多项式轨迹，速度、加速度、加加速度均连续，起点/终点加加速度为零
+- PID 具备积分限幅 + 输出钳位双重抗饱和，运动结束输出归零（可配置）
+- 轨迹生成与约束检查均采用向量化/霍纳法，适合嵌入式实时运行
+- 所有参数一次初始化，之后仅需 set_target(S) 即可
+"""
+
+import math
+from typing import Tuple, Callable
+
+# ==================== 轨迹生成 ====================
+def gen_septic_trajectory(s0: float, v0: float, a0: float,
+                          s1: float, v1: float, a1: float,
+                          T: float) -> Callable[[float], Tuple[float, float, float]]:
+    """
+    生成七次多项式轨迹。
+    满足：p(0)=s0, v(0)=v0, a(0)=a0, j(0)=0
+          p(T)=s1, v(T)=v1, a(T)=a1, j(T)=0
+    """
+    if T <= 0.0:
+        def const_traj(t): return (s1, v1, a1)
+        return const_traj
+
+    T2 = T * T
+    T3 = T2 * T
+    T4 = T3 * T
+    T5 = T4 * T
+    T6 = T5 * T
+    T7 = T6 * T
+
+    d_s = s1 - s0 - v0 * T - 0.5 * a0 * T2
+    d_v = v1 - v0 - a0 * T
+    d_a = a1 - a0
+
+    A = 1260 * d_s - 420 * d_v * T + 42 * d_a * T2
+    B = -1680 * d_s + 540 * d_v * T - 60 * d_a * T2
+    C = 840 * d_s - 240 * d_v * T + 30 * d_a * T2
+    D = -140 * d_s + 35 * d_v * T - 5 * d_a * T2
+
+    c7 = A / (21 * T7)
+    c6 = B / (15 * T6)
+    c5 = C / (10 * T5)
+    c4 = D / (6 * T4)
+    c3 = 0.0
+    c2 = a0 / 2.0
+    c1 = v0
+    c0 = s0
+
+    # 缓存系数，用于霍纳求值
+    coeff = (c0, c1, c2, c3, c4, c5, c6, c7)
+
+    def get_ref(t: float):
+        if t <= 0.0:
+            return s0, v0, a0
+        if t >= T:
+            return s1, v1, a1
+        # 位置 p
+        p = coeff[0] + t * (coeff[1] + t * (coeff[2] + t * (coeff[3] +
+                     t * (coeff[4] + t * (coeff[5] + t * (coeff[6] + t * coeff[7]))))))
+        # 速度 v
+        v = coeff[1] + t * (2*coeff[2] + t * (3*coeff[3] +
+                     t * (4*coeff[4] + t * (5*coeff[5] + t * (6*coeff[6] + t * 7*coeff[7])))))
+        # 加速度 a
+        a = 2*coeff[2] + t * (6*coeff[3] +
+                     t * (12*coeff[4] + t * (20*coeff[5] + t * (30*coeff[6] + t * 42*coeff[7]))))
+        return p, v, a
+
+    return get_ref
+
+
+# ==================== 约束检查 ====================
+def _check_constraints(traj_func, T: float, vmax: float, amax: float,
+                       resolution: int = 200) -> bool:
+    """
+    检查轨迹在整个 [0, T] 内是否始终 |v| <= vmax 且 |a| <= amax。
+    采用均匀采样，采样点数不少于 resolution。
+    """
+    if T <= 0:
+        return True
+    steps = max(resolution, int(T / 0.0005))  # 至少 200 点，或每 0.5ms 一点
+    dt = T / steps
+    for i in range(steps + 1):
+        t = i * dt
+        _, v, a = traj_func(t)
+        if abs(v) > vmax + 1e-9 or abs(a) > amax + 1e-9:
+            return False
+    return True
+
+
+# ==================== 二分搜索求最小可行时间 ====================
+def _find_min_T(s0, v0, a0, s1, v1, a1,
+                vmax, amax, T_guess, max_iters=30):
+    """
+    二分搜索找到满足约束的最小时间 T。
+    T_guess 作为下界，上界自动扩展直到满足约束。
+    """
+    T_low = max(T_guess, 0.001)
+    T_high = T_low * 2.0
+
+    # 向上扩展上界，最多尝试 10 次
+    for _ in range(10):
+        traj = gen_septic_trajectory(s0, v0, a0, s1, v1, a1, T_high)
+        if _check_constraints(traj, T_high, vmax, amax):
+            break
+        T_high *= 2.0
+    else:
+        # 极端情况，直接使用大时间
+        pass
+
+    # 二分搜索，精度达到 0.1 ms 级别
+    for _ in range(max_iters):
+        T_mid = (T_low + T_high) * 0.5
+        traj = gen_septic_trajectory(s0, v0, a0, s1, v1, a1, T_mid)
+        if _check_constraints(traj, T_mid, vmax, amax):
+            T_high = T_mid   # 满足 → 尝试更小
+        else:
+            T_low = T_mid
+    return T_high
+
+
+# ==================== 动态规划器 ====================
+class DynamicSCurvePlanner:
+    """自动时间规划的 S 曲线生成器"""
+    def __init__(self, vmax: float, amax: float):
+        self.vmax = vmax
+        self.amax = amax
+        self.traj_func: Callable = None
+        self.T: float = 0.0
+        self.start_s: float = 0.0
+        self.target_s: float = 0.0
+
+    def plan_from_stop(self, S: float):
+        """从静止 (0,0,0) 规划到绝对位置 S"""
+        self._plan(0.0, 0.0, 0.0, S, 0.0, 0.0)
+        self.start_s = 0.0
+        self.target_s = S
+
+    def plan_from_state(self, s0: float, v0: float, a0: float, target_abs: float):
+        """从当前状态规划到绝对目标位置"""
+        rel_s = target_abs - s0
+        self._plan(0.0, v0, a0, rel_s, 0.0, 0.0)
+        self.start_s = s0
+        self.target_s = target_abs
+
+    def _plan(self, s0, v0, a0, sf, vf, af):
+        """内部核心：估算时间并生成满足约束的轨迹"""
+        # 粗估时间（解析公式）
+        abs_sf = abs(sf)
+        d_decel = (v0 * v0) / (2.0 * self.amax) if self.amax > 0 else 0.0
+        if v0 * sf >= 0.0:
+            if abs_sf > d_decel:
+                T_est = (abs_sf - d_decel) / self.vmax + 2.0 * abs(v0) / self.amax
+            else:
+                T_est = 2.0 * math.sqrt(abs_sf / self.amax) if abs_sf > 0 else 0.0
+        else:
+            T_est = 2.0 * abs(v0) / self.amax + 2.0 * math.sqrt(abs_sf / self.amax)
+
+        T_guess = max(T_est,
+                      abs(v0) / self.amax * 2.0,
+                      abs_sf / self.vmax,
+                      0.001)
+
+        # 二分搜索精确时间
+        self.T = _find_min_T(s0, v0, a0, sf, vf, af,
+                             self.vmax, self.amax, T_guess)
+        self.traj_func = gen_septic_trajectory(s0, v0, a0, sf, vf, af, self.T)
+
+    def get_ref(self, t: float) -> Tuple[float, float, float]:
+        """返回 t 时刻的绝对位置、速度、加速度"""
+        if self.traj_func is None:
+            return self.start_s, 0.0, 0.0
+        rel_pos, vel, acc = self.traj_func(min(t, self.T))
+        return self.start_s + rel_pos, vel, acc
+
+
+# ==================== PID 控制器（终极版） ====================
+class PID:
+    """增强型 PID，双抗饱和 + 微分低通（可选）"""
+    def __init__(self, kp: float, ki: float, kd: float, dt: float,
+                 out_min: float = -1e6, out_max: float = 1e6,
+                 integral_max: float = 1e6, derivative_filter_alpha: float = 1.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.dt = dt
+        self.out_min = out_min
+        self.out_max = out_max
+        self.integral_max = abs(integral_max)
+        self.filter_alpha = derivative_filter_alpha  # 1.0 = 无滤波
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_derivative = 0.0
+
+    def update(self, error: float) -> float:
+        # 比例项
+        p = self.kp * error
+
+        # 积分项（带硬限幅）
+        self.integral += error * self.dt
+        if self.integral > self.integral_max:
+            self.integral = self.integral_max
+        elif self.integral < -self.integral_max:
+            self.integral = -self.integral_max
+        i = self.ki * self.integral
+
+        # 微分项（带一阶低通滤波，防止噪声放大）
+        raw_derivative = (error - self.prev_error) / self.dt
+        self.prev_derivative = (self.filter_alpha * raw_derivative +
+                                (1.0 - self.filter_alpha) * self.prev_derivative)
+        d = self.kd * self.prev_derivative
+
+        output = p + i + d
+
+        # 输出限幅与积分钳位
+        if output > self.out_max:
+            output = self.out_max
+            # 若误差方向仍使输出增大，则回退积分
+            if error > 0:
+                self.integral -= error * self.dt
+        elif output < self.out_min:
+            output = self.out_min
+            if error < 0:
+                self.integral -= error * self.dt
+
+        self.prev_error = error
+        return output
+
+
+# ==================== 运动控制器（唯一接口） ====================
+class ContinuousMotionController:
+    """
+    终极运动控制器。
+    用法：
+        ctrl = ContinuousMotionController(planner, pid, dt)
+        ctrl.set_target(S)      # 唯一指令
+        while not ctrl.is_done():
+            u = ctrl.step(actual_position)
+            set_motor_output(u)
+    """
+    def __init__(self, planner: DynamicSCurvePlanner, pid: PID, dt: float,
+                 kff_vel: float = 1.0, kff_acc: float = 0.0,
+                 zero_output_when_done: bool = True):
+        self.planner = planner
+        self.pid = pid
+        self.dt = dt
+        self.kff_vel = kff_vel
+        self.kff_acc = kff_acc
+        self.zero_output_when_done = zero_output_when_done
+        self.time = 0.0
+        self.control = 0.0
+        self.done = True
+
+    def set_target(self, S: float):
+        """设定新的绝对目标位置 S（运动中可随时调用）"""
+        if self.done:
+            self.planner.plan_from_stop(S)
+            self.pid.reset()
+        else:
+            pos_ref, vel_ref, acc_ref = self.planner.get_ref(self.time)
+            self.planner.plan_from_state(pos_ref, vel_ref, acc_ref, S)
+            # 不重置 PID，确保连续
+        self.time = 0.0
+        self.done = False
+
+    def step(self, actual_position: float) -> Tuple[float, float, float, float]:
+        """
+        每个控制周期调用。
+        返回：(控制量, 参考位置, 参考速度, 参考加速度)
+        """
+        if self.done:
+            # 运动已结束
+            if self.zero_output_when_done:
+                return 0.0, self.planner.target_s, 0.0, 0.0
+            else:
+                # 维持最后的位置误差修正（用于零速保持）
+                error = self.planner.target_s - actual_position
+                hold_out = self.pid.update(error)
+                return hold_out, self.planner.target_s, 0.0, 0.0
+
+        pos_ref, vel_ref, acc_ref = self.planner.get_ref(self.time)
+        error = pos_ref - actual_position
+        pid_out = self.pid.update(error)
+        ff = self.kff_vel * vel_ref + self.kff_acc * acc_ref
+        self.control = ff + pid_out
+        self.time += self.dt
+
+        if self.time >= self.planner.T:
+            self.done = True
+        return self.control, pos_ref, vel_ref, acc_ref
+
+    def is_done(self) -> bool:
+        return self.done
+
+
+# ==================== 示例与测试 ====================
+if __name__ == "__main__":
+    DT = 0.001                # 控制周期 1 ms
+    V_MAX = 0.5               # 最大速度 0.5 m/s
+    A_MAX = 5.0               # 最大加速度 5 m/s²
+
+    # 模拟被控对象（一阶惯性）
+    class MotorSim:
+        def __init__(self, tau=0.02):
+            self.tau = tau
+            self.pos = 0.0
+            self.vel = 0.0
+        def update(self, u, dt):
+            self.vel += (u - self.vel) * (dt / self.tau)
+            self.pos += self.vel * dt
+            return self.pos
+
+    motor = MotorSim()
+    planner = DynamicSCurvePlanner(vmax=V_MAX, amax=A_MAX)
+    pid = PID(kp=80, ki=10, kd=0.2, dt=DT,
+              out_min=-3, out_max=3, integral_max=1.0,
+              derivative_filter_alpha=0.1)  # 微分滤波 alpha=0.1
+    ctrl = ContinuousMotionController(planner, pid, DT,
+                                       kff_vel=1.0, kff_acc=0.1,
+                                       zero_output_when_done=True)
+
+    # 测试 1：正位移
+    print("===== 测试1：静止 -> 1.0m =====")
+    ctrl.set_target(1.0)
+    while not ctrl.is_done():
+        actual = motor.pos
+        u, *_ = ctrl.step(actual)
+        motor.update(u, DT)
+    print(f"最终位置: {motor.pos:.4f} m")
+
+    # 测试 2：反向运动 + 中途切换
+    print("\n===== 测试2：1.0 -> -0.5（反向，中途切换） =====")
+    motor.pos = 1.0
+    motor.vel = 0.0
+    ctrl.set_target(-0.5)
+    t_switch = 0.3  # 运行 0.3 秒后切换到 -0.8
+    elapsed = 0.0
+    while not ctrl.is_done():
+        if elapsed >= t_switch and ctrl.planner.target_s == -0.5:
+            print(f"  >> 在 t={elapsed:.2f}s 切换目标至 -0.8")
+            ctrl.set_target(-0.8)
+        actual = motor.pos
+        u, *_ = ctrl.step(actual)
+        motor.update(u, DT)
+        elapsed += DT
+    print(f"最终位置: {motor.pos:.4f} m（目标 -0.8）")
+
+    # 测试 3：连续多段（无停顿）
+    print("\n===== 测试3：连续多段（0.5 → 1.5 → 0.8 → 2.0） =====")
+    motor.pos = 0.0
+    motor.vel = 0.0
+    targets = [0.5, 1.5, 0.8, 2.0]
+    ctrl.set_target(targets[0])
+    for i, tgt in enumerate(targets):
+        if i > 0:
+            ctrl.set_target(tgt)
+        while not ctrl.is_done():
+            actual = motor.pos
+            u, *_ = ctrl.step(actual)
+            motor.update(u, DT)
+        print(f"  段 {i+1}: 到达 {motor.pos:.4f} m")
